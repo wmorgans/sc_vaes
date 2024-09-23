@@ -1,5 +1,4 @@
 import torch
-from types import List
 from .base_vae import BaseVAE
 from torch import nn
 from torch import optim
@@ -17,14 +16,15 @@ class VanillaVAE(BaseVAE):
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: nn.Sequential | None = None,
                  decoder: nn.Sequential | None = None,
-                 **kwargs) -> None:
+                 kl_weight = 0.00025) -> None:
         super().__init__()
 
         self.latent_dim = latent_dim
+        self.kl_weight = kl_weight
 
         # Build Encoder
         if encoder is None:
-            encoder = FC_block(in_channels, latent_dim, hidden_dims)
+            encoder = FC_block(in_channels, hidden_dims[-1], hidden_dims[:-2])
 
         self.encoder = encoder
 
@@ -35,6 +35,8 @@ class VanillaVAE(BaseVAE):
         if decoder is None:
            hidden_dims.reverse()
            decoder = FC_block(self.latent_dim, in_channels, hidden_dims)
+        
+        self.decoder = decoder
 
     def encode(self, input: Tensor) -> List[Tensor]:
         """
@@ -44,7 +46,7 @@ class VanillaVAE(BaseVAE):
         :return: (Tensor) List of latent codes [[N x D], [N x D]]
         """
         result = self.encoder(input)
-        result = torch.flatten(result, start_dim=1)
+        #result = torch.flatten(result, start_dim=1)
 
         # Split the result into mu and var components
         # of the latent Gaussian distribution
@@ -78,7 +80,7 @@ class VanillaVAE(BaseVAE):
     def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
         mu, log_var = self.encode(input)
         z = self.reparameterize(mu, log_var)
-        return  [self.decode(z), input, mu, log_var]
+        return self.decode(z), input, mu, log_var
 
     def loss_function(self,
                       *args,
@@ -95,7 +97,7 @@ class VanillaVAE(BaseVAE):
         mu = args[2]
         log_var = args[3]
 
-        kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
+        kld_weight = self.kl_weight # Account for the minibatch samples from the dataset
         recons_loss =F.mse_loss(recons, input)
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
@@ -131,21 +133,24 @@ class VanillaVAE(BaseVAE):
         return self.forward(x)[0]
     
     def training_step(self, batch, batch_idx):
-        x , _ =  batch
-        losses = self.loss_function(self.forward(x))
+        x  =  batch[0]
+        losses = self.loss_function(*self.forward(x))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
         return losses
     
     def test_step(self, batch, batch_idx):
         # this is the test loop
-        x, _ = batch
-        losses = self.loss_function(self.forward(x))
-        self.log_dict("test_loss", losses)
+        x = batch[0]
+        losses = self.loss_function(*self.forward(x))
+        self.log_dict(losses)
 
     def validation_step(self, batch, batch_idx):
         # this is the validation loop
-        x, _ = batch
-        losses = self.loss_function(self.forward(x))
-        self.log_dict("val_loss", losses)
+        x = batch[0]
+        losses = self.loss_function(*self.forward(x))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        val_loss = losses['loss']
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=0.001)
@@ -157,33 +162,33 @@ class Gen_rna_vae(VanillaVAE):
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: Any | None = None,
                  decoder: Any | None = None,
-                 dropout_nn: any | None = None,
+                 dropout_nn: Any | None = None,
+                 kl_weight = 0.00025,
                  **kwargs) -> None:
-        
-        
+
         # Build Encoder
         if encoder is None:
-            encoder = FC_block(in_channels + 1, latent_dim, hidden_dims)
-
-        self.encoder = encoder
-
-        self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
+            encoder = FC_block(in_channels + 1, hidden_dims[-1], hidden_dims[:-2])
 
         # Build Decoder
         if decoder is None:
-           hidden_dims.reverse()
-           activation_funcs = len(hidden_dims)*[nn.ReLU()] + [nn.Softmax()]
-           decoder = FC_block(self.latent_dim + 1, in_channels, hidden_dims,
-                              activations=activation_funcs)
-        
-        
+            hidden_dims.reverse()
+            activation_funcs = len(hidden_dims)*[nn.ReLU()] + [nn.Softmax()]
+            decoder = FC_block(latent_dim + 1, in_channels, hidden_dims,
+                               activations=activation_funcs)
+            hidden_dims.reverse()
+
+        super().__init__(in_channels, latent_dim, hidden_dims=hidden_dims,
+                         encoder=encoder, decoder=decoder, kl_weight=kl_weight)
+
         # Build dropout
         if dropout_nn is None:
             dropout_nn = FC_block(self.latent_dim + 1, in_channels, [128],
                                   activations=[nn.ReLU(), nn.Sigmoid()])
+
+        self.dropout_nn = dropout_nn
             
-        self.dispersion = torch.rand(in_channels, requires_grad=True)
+        self.dispersion = torch.rand(in_channels, requires_grad=True, device='cuda')
 
 
     def encode(self, input: Tensor, batch: Tensor) -> List[Tensor]:
@@ -195,9 +200,9 @@ class Gen_rna_vae(VanillaVAE):
         :return: (Tensor) List of latent codes [[N x D], [N x D]]
         """
         input = torch.cat((input, batch), 1)
+        print(input.shape)
         result = self.encoder(input)
-        result = torch.flatten(result, start_dim=1)
-
+        print(result.shape)
         # Split the result into mu and var components
         # of the latent Gaussian distribution
         mu = self.fc_mu(result)
@@ -216,7 +221,7 @@ class Gen_rna_vae(VanillaVAE):
         """
         input = torch.cat((z, batch), 1)
         result = self.decoder(input)
-        result = torch.gamma.Gamma(result, theta).sample()
+        result = torch.distributions.gamma.Gamma(result, theta).sample()
         return result
     
     def forward(self, input: Tensor, batch, theta, read_depth, **kwargs) -> List[Tensor]:
@@ -226,7 +231,6 @@ class Gen_rna_vae(VanillaVAE):
 
         mean_poisson = proportions * torch.exp(read_depth)  #(scVI px_rate)
         sampled_poisson = torch.distributions.poisson.Poisson(mean_poisson).sample()
-
 
         p_drop_out = self.dropout_nn(torch.cat((z, batch), 1))
         sampled_drop_out = torch.distributions.bernoulli.Bernoulli(probs=p_drop_out).sample()
@@ -254,13 +258,47 @@ class Gen_rna_vae(VanillaVAE):
         p_drop_out = args[4]
 
 
-        kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
+        kld_weight =  self.kl_weight
         recons_loss = self.get_zinb_loss(input, mean_poisson, p_drop_out, self.dispersion)
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
         loss = recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
+
+    def training_step(self, batch, batch_idx):
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+        read_depth = batch[1]['read_depth']
+
+        losses = self.loss_function(*self.forward(x, batch_id,
+                                                  self.dispersion,
+                                                  read_depth))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        return losses
+    
+    def test_step(self, batch, batch_idx):
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+        read_depth = batch[1]['read_depth']
+
+        losses = self.loss_function(*self.forward(x, batch_id,
+                                                  self.dispersion,
+                                                  read_depth))
+        self.log_dict(losses)
+
+    def validation_step(self, batch, batch_idx):
+        # this is the validation loop
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+        read_depth = batch[1]['read_depth']
+        losses = self.loss_function(*self.forward(x, batch_id,
+                                                  self.dispersion,
+                                                  read_depth))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        val_loss = losses['loss']
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
+    
     
     def get_zinb_loss(self, x, mean_poiss, prob_dropout, dispersion):
         where_zero = torch.le(x, EPS)
