@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 from anndata import AnnData
+import scipy
 
 def ann_collate(data):
     """
@@ -53,33 +54,54 @@ class RNA_AnnDataset(Dataset):
 
             meta_labels = {}
             for key_lab, val_lab in self.meta_labs_names.items():
-                meta_labels[key_lab] = self.anndata.obs.loc[self.anndata.obs.index[idx], val_lab]
+                dtype = self._check_metavar_dtype(self.anndata.obs[val_lab])
+                meta_labels[key_lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idx],
+                                                                                       val_lab].values, dtype=dtype), (-1, 1))
         elif isinstance(self.meta_labs_names, list):
             meta_labels = {}
             for lab in self.meta_labs_names:
-                meta_labels[lab] = self.anndata.obs.loc[self.anndata.obs.index[idx], lab]
+                dtype = self._check_metavar_dtype(self.anndata.obs[lab])
+                meta_labels[lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idx],
+                                                                                   lab].values, dtype=dtype), (-1, 1))
         else:
             raise TypeError('meta_labs_names must be None | list | dict')
             
         return [cell, meta_labels]
     
     def __getitems__(self, idxs):
-        cells = torch.tensor(self.anndata.X[idxs, :].todense(), dtype=torch.float)
+        if scipy.sparse.issparse(self.anndata.X):
+            cells = torch.tensor(self.anndata.X[idxs, :].todense(), dtype=torch.float)
+        else:
+            cells = torch.tensor(self.anndata.X[idxs, :], dtype=torch.float)
+
         if self.meta_labs_names is None:
             return [cells]
         elif isinstance(self.meta_labs_names, dict):
             meta_labels = {}
             for key_lab, val_lab in self.meta_labs_names.items():
-                meta_labels[key_lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idxs], val_lab].values), (-1, 1))
+                dtype = self._check_metavar_dtype(self.anndata.obs[val_lab])
+                meta_labels[key_lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idxs],
+                                                                                       val_lab].values, dtype=dtype),(-1, 1))
         elif isinstance(self.meta_labs_names, list):
             meta_labels = {}
             for lab in self.meta_labs_names:
-                meta_labels[lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idxs], lab].values), (-1, 1))
+                dtype = self._check_metavar_dtype(self.anndata.obs[lab])
+                meta_labels[lab] = torch.reshape(torch.tensor(self.anndata.obs.loc[self.anndata.obs.index[idxs],
+                                                                                   lab].values, dtype=dtype), (-1, 1))
         else:
             raise TypeError('meta_labs_names must be None | list | dict') 
         
         return [cells, meta_labels]
-        
+    
+    def _check_metavar_dtype(self, series: pd.Series):
+        if series.dtype == int:
+            dtype = torch.int
+        elif series.dtype == float:
+            dtype = torch.float
+        else:
+            raise TypeError('dtype of meta labels (df columns), must be int or float')
+        return dtype
+    
     def split(self, proportions:list[int]):
         idx = np.arange(self.anndata.shape[0])
         np.random.shuffle(idx)  #inplace

@@ -5,7 +5,7 @@ from torch import optim
 from torch.nn import functional as F
 from ..types import *
 from ..utils import FC_block
-from .rna_vae import VanillaVAE, Gen_rna_vae
+from .rna_vae import VanillaVAE, Gen_rna_vae_nb
 import numpy as np
 
 EPS = 1e-7
@@ -17,16 +17,22 @@ class Time_Vae_ord(VanillaVAE):
                  y_stars: torch.Tensor,
                  edges: np.array,
                  *args,
-                 time_weight = 0.2,
+                 initial_time_weight = 0.01,
+                 final_time_weight = 0.5,
                  n_epoch_ramp = 10,
                  **kwargs) -> None:
                 
                 super().__init__(*args, **kwargs)
                 
-                self.time_weight = time_weight
+                self.initial_time_weight = initial_time_weight
+                self.final_time_weight = final_time_weight
+                self.n_epoch_ramp = n_epoch_ramp
                 self.y_stars = y_stars
                 self.edges = edges
                 self.time_regressor = RegressorLinear(self.latent_dim)
+
+    def get_time_weight(self, epoch):
+        return self.initial_time_weight - ((self.initial_time_weight - self.final_time_weight) * (epoch / self.n_epoch_ramp))
 
     def loss_function(self, recons, input, mu, log_var, pred_time, time, **kwargs) -> dict:
         recons_loss =F.mse_loss(recons, input)
@@ -34,9 +40,13 @@ class Time_Vae_ord(VanillaVAE):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
         kld_loss = kld_loss / mu.numel()
         
+        kld_loss = kld_loss / mu.numel()
+        
         ord_loss = self.ord_loss(pred_time, time)
 
-        loss = recons_loss + self.kl_weight * kld_loss + ord_loss*self.time_weight
+        time_weight = self.get_time_weight(self.current_epoch)
+
+        loss = recons_loss + self.kl_weight * kld_loss + ord_loss*time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'ord_loss':ord_loss} 
     
@@ -92,6 +102,7 @@ class Time_Vae_ord(VanillaVAE):
                           std_normal.cdf(self.edges[i][1] - y_pred)
                           - std_normal.cdf(self.edges[i][0] - y_pred) + EPS)
                                                                                 
+                                                                                
             # log_likelihood = log_likelihood - \
             #                     torch.sum(  
             #                       torch.tensor([y_star[y]*torch.log(std_normal.cdf(self.edges[i][1] - y_pred) -
@@ -133,7 +144,7 @@ class Time_Vae_reg_non_linear(Time_Vae_reg, VanillaVAE):
         self.time_weight = time_weight
         self.time_regressor = FC_block(self.latent_dim, 1, hidden_dims=time_reg_hidden)
 
-class Time_Vae_ord_nb(Gen_rna_vae):
+class Time_Vae_ord_nb(Gen_rna_vae_nb):
     def __init__(self,
                  y_stars: torch.Tensor,
                  edges: np.array,
@@ -223,12 +234,12 @@ class Time_Vae_ord_nb(Gen_rna_vae):
         return log_likelihood[0]/pred_ys.numel()
 
 
-class Time_Vae_reg_nb(Time_Vae_ord_nb, Gen_rna_vae):
+class Time_Vae_reg_nb(Time_Vae_ord_nb, Gen_rna_vae_nb):
     def __init__(self,
                 *args,
                 time_weight = 0.2,
                 **kwargs) -> None:
-        Gen_rna_vae.__init__(self, *args, **kwargs)
+        Gen_rna_vae_nb.__init__(self, *args, **kwargs)
         self.time_weight = time_weight
         self.time_regressor = RegressorLinear(self.latent_dim)
         

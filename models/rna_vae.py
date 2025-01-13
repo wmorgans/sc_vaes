@@ -16,8 +16,9 @@ class VanillaVAE(BaseVAE):
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: nn.Sequential | None = None,
                  decoder: nn.Sequential | None = None,
-                 kl_weight = 0.00025) -> None:
+                 kl_weight = 0.05) -> None:
         super().__init__()
+        self.save_hyperparameters()
 
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
@@ -35,6 +36,7 @@ class VanillaVAE(BaseVAE):
         if decoder is None:
            hidden_dims.reverse()
            decoder = FC_block(self.latent_dim, in_channels, hidden_dims)
+           hidden_dims.reverse()
         
         self.decoder = decoder
 
@@ -101,9 +103,10 @@ class VanillaVAE(BaseVAE):
         recons_loss =F.mse_loss(recons, input)
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+        kld_loss = kld_loss/mu.numel()
 
         loss = recons_loss + kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
 
     def sample(self,
                num_samples:int,
@@ -136,7 +139,7 @@ class VanillaVAE(BaseVAE):
         x  =  batch[0]
         losses = self.loss_function(*self.forward(x))
         self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
-        return losses
+        return losses['loss']
     
     def test_step(self, batch, batch_idx):
         # this is the test loop
@@ -155,18 +158,19 @@ class VanillaVAE(BaseVAE):
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=0.001)
     
-class Gen_rna_vae(VanillaVAE):
+class Gen_rna_vae_nb(VanillaVAE):
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: Any | None = None,
                  decoder: Any | None = None,
-                 dropout_nn: Any | None = None,
-                 kl_weight = 0.00025,
+                 kl_weight = 0.05,
+                 epsilon = 1e-8,
+                 disp_range = (-10, 10),
                  **kwargs) -> None:
 
-        # Build Encoder
+        # Build Encoder. This is not handled in VanillaVAE as the batch_id is appended to the input vector 
         if encoder is None:
             encoder = FC_block(in_channels + 1, hidden_dims[-1], hidden_dims[:-2])
 
@@ -180,15 +184,10 @@ class Gen_rna_vae(VanillaVAE):
 
         super().__init__(in_channels, latent_dim, hidden_dims=hidden_dims,
                          encoder=encoder, decoder=decoder, kl_weight=kl_weight)
-
-        # Build dropout
-        if dropout_nn is None:
-            dropout_nn = FC_block(self.latent_dim + 1, in_channels, [128],
-                                  activations=[nn.ReLU(), nn.Sigmoid()])
-
-        self.dropout_nn = dropout_nn
             
-        self.dispersion = torch.rand(in_channels, requires_grad=True, device='cuda')
+        self.log_dispersion = nn.Parameter(torch.rand(in_channels))
+        self.epsilon = epsilon
+        self.disp_range = disp_range
 
 
     def encode(self, input: Tensor, batch: Tensor) -> List[Tensor]:
@@ -200,9 +199,7 @@ class Gen_rna_vae(VanillaVAE):
         :return: (Tensor) List of latent codes [[N x D], [N x D]]
         """
         input = torch.cat((input, batch), 1)
-        print(input.shape)
         result = self.encoder(input)
-        print(result.shape)
         # Split the result into mu and var components
         # of the latent Gaussian distribution
         mu = self.fc_mu(result)
@@ -210,7 +207,7 @@ class Gen_rna_vae(VanillaVAE):
 
         return [mu, log_var]
     
-    def decode(self, z: Tensor, batch: Tensor, theta: Tensor) -> Tensor:
+    def decode(self, z: Tensor, batch: Tensor) -> Tensor:
         """
         Maps the given latent codes
         onto the image space.
@@ -220,26 +217,109 @@ class Gen_rna_vae(VanillaVAE):
         :return: (Tensor) [B x F]
         """
         input = torch.cat((z, batch), 1)
-        result = self.decoder(input)
-        result = torch.distributions.gamma.Gamma(result, theta).sample()
-        return result
+        pred_mean = self.decoder(input)
+        return pred_mean
     
-    def forward(self, input: Tensor, batch, theta, read_depth, **kwargs) -> List[Tensor]:
+    def forward(self, input: Tensor, batch, **kwargs) -> List[Tensor]:
         mu, log_var = self.encode(input, batch)
         z = self.reparameterize(mu, log_var)
-        proportions = self.decode(z, batch, theta)  #mean gamma (scVI px_scale)
+        pred_mean = self.decode(z, batch)  #mean gamma (scVI px_scale)
+                                                                        
+        return  [input, mu, log_var, pred_mean]
 
-        mean_poisson = proportions * torch.exp(read_depth)  #(scVI px_rate)
-        sampled_poisson = torch.distributions.poisson.Poisson(mean_poisson).sample()
+    def loss_function(self,
+                      *args,
+                      **kwargs) -> dict:
+        """
+        Computes the VAE loss function.
+        KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        input = args[0]
+        mu = args[1]
+        log_var = args[2]
+        scaled_pred_mean = args[3]
 
-        p_drop_out = self.dropout_nn(torch.cat((z, batch), 1))
-        sampled_drop_out = torch.distributions.bernoulli.Bernoulli(probs=p_drop_out).sample()
-                                                                   
-        drop_out_mask = sampled_drop_out.type(torch.bool)^1
+        kld_weight =  self.kl_weight
+        recons_loss = self.get_nb_loss(input, scaled_pred_mean)
+
+        kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp())
+        kld_loss = kld_loss/mu.numel()
+
+        loss = recons_loss + kld_weight * kld_loss
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
+
+    def training_step(self, batch, batch_idx):
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+
+        losses = self.loss_function(*self.forward(x, batch_id))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        return losses['loss']
+    
+    def test_step(self, batch, batch_idx):
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+
+        losses = self.loss_function(*self.forward(x, batch_id))
+        self.log_dict(losses)
+
+    def validation_step(self, batch, batch_idx):
+        # this is the validation loop
+        x  =  batch[0]
+        batch_id = batch[1]['batch']
+
+        losses = self.loss_function(*self.forward(x, batch_id))
+        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        val_loss = losses['loss']
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
+    
+    
+    def get_nb_loss(self, x, mean_poiss):
+        # For stability
+        dispersion = torch.exp(torch.clamp(self.log_dispersion, min=self.disp_range[0], max=self.disp_range[1]))
+        mean_poiss = torch.clamp(mean_poiss, min=self.epsilon)
+        disp_plus_mu = torch.clamp(mean_poiss + dispersion, min=self.epsilon)
+
+        # Log-Gamma terms
+        log_gamma_terms = torch.lgamma(x + dispersion) - torch.lgamma(dispersion) -  torch.lgamma(x + 1)  # log(y!)
         
-        observed = drop_out_mask*sampled_poisson
-        return  [observed, input, mu, log_var, mean_poisson, p_drop_out]
+        # Log-probability components
+        log_p1 = dispersion * torch.log(dispersion / disp_plus_mu)
+        log_p2 = x * torch.log(mean_poiss / disp_plus_mu)
+        
+        # Negative Binomial loss
+        loss = log_gamma_terms + log_p1 + log_p2
+        return -loss.sum()/x.numel()  # Return negative log-likelihood
 
+
+class Gen_rna_vae_zinb(Gen_rna_vae_nb):
+    """
+    This has not been finished yet
+    """
+    def __init__(self,
+                 in_channels: int,
+                 latent_dim: int,
+                 hidden_dims: List | None = [512, 256, 128, 64, 32],
+                 encoder: Any | None = None,
+                 decoder: Any | None = None,
+                 dropout_nn: Any | None = None,
+                 kl_weight = 0.00025,
+                 **kwargs) -> None:
+        
+        # Build dropout
+        if dropout_nn is None:
+            dropout_nn = FC_block(self.latent_dim + 1, in_channels, [128],
+                                  activations=[nn.ReLU(), nn.Sigmoid()])
+
+        self.dropout_nn = dropout_nn
+
+
+        super().__init__(in_channels, latent_dim, hidden_dims=hidden_dims,
+                         encoder=encoder, decoder=decoder, kl_weight=kl_weight)
+        
     def loss_function(self,
                       *args,
                       **kwargs) -> dict:
@@ -264,61 +344,20 @@ class Gen_rna_vae(VanillaVAE):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
         loss = recons_loss + kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
-
-    def training_step(self, batch, batch_idx):
-        x  =  batch[0]
-        batch_id = batch[1]['batch']
-        read_depth = batch[1]['read_depth']
-
-        losses = self.loss_function(*self.forward(x, batch_id,
-                                                  self.dispersion,
-                                                  read_depth))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
-        return losses
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
     
-    def test_step(self, batch, batch_idx):
-        x  =  batch[0]
-        batch_id = batch[1]['batch']
-        read_depth = batch[1]['read_depth']
+    def forward(self, input: Tensor, batch, theta, read_depth, **kwargs) -> List[Tensor]:
+        mu, log_var = self.encode(input, batch)
+        z = self.reparameterize(mu, log_var)
+        proportions = self.decode(z, batch, theta)  #mean gamma (scVI px_scale)
 
-        losses = self.loss_function(*self.forward(x, batch_id,
-                                                  self.dispersion,
-                                                  read_depth))
-        self.log_dict(losses)
+        mean_poisson = proportions * torch.exp(read_depth)  #(scVI px_rate)
+        sampled_poisson = torch.distributions.poisson.Poisson(mean_poisson).sample()
 
-    def validation_step(self, batch, batch_idx):
-        # this is the validation loop
-        x  =  batch[0]
-        batch_id = batch[1]['batch']
-        read_depth = batch[1]['read_depth']
-        losses = self.loss_function(*self.forward(x, batch_id,
-                                                  self.dispersion,
-                                                  read_depth))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
-        val_loss = losses['loss']
-        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
-    
-    
-    def get_zinb_loss(self, x, mean_poiss, prob_dropout, dispersion):
-        where_zero = torch.le(x, EPS)
-
-        zeros = torch.zeros(x.shape)
-
-        case_zero_loss = torch.log(prob_dropout + (1 - prob_dropout)*self.get_nb_zero_loss(mean_poiss, dispersion))
-
-        case_non_zero_loss = self.get_nb_log_loss(x, mean_poiss, dispersion)
-
-        comb_loss = where_zero*case_zero_loss + (~where_zero)*case_non_zero_loss
-
-        return torch.sum(comb_loss)
-
-    def get_nb_log_loss(self, x, mean_poiss, dispersion):
-        return torch.lgamma(x + dispersion) - torch.lgamma(x + 1)  - torch.lgamma(dispersion) \
-            + x*torch.log(1 - mean_poiss) + dispersion*torch.log(mean_poiss)
-    
-    def get_nb_zero_loss(self, mean_poiss, dispersion):
-        return torch.pow(mean_poiss, dispersion)
-
-
-
+        p_drop_out = self.dropout_nn(torch.cat((z, batch), 1))
+        sampled_drop_out = torch.distributions.bernoulli.Bernoulli(probs=p_drop_out).sample()
+                                                                
+        drop_out_mask = sampled_drop_out.type(torch.bool)^1
+        
+        observed = drop_out_mask*sampled_poisson
+        return  [observed, input, mu, log_var, mean_poisson, p_drop_out]
