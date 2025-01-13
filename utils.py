@@ -33,7 +33,7 @@ def FC_block(first_layer: int,
 
     return nn.Sequential(*modules)
 
-def string_to_splits(series: pd.Series):
+def string_to_splits(series: pd.Series, pad_edge=False, inf_edge = False):
     '''
     Format should be list of  number_number
     '''
@@ -59,14 +59,26 @@ def string_to_splits(series: pd.Series):
     
     mask = ~torch.all(y_stars == 0, axis=1)
     y_stars = y_stars[mask]  #drop rows of all 0
-    new_edges = new_edges[mask]
-
     y_stars = y_stars/y_stars.sum(axis=1, keepdims=True)
-    new_edges[[0, -1], [0, -1]] = torch.tensor([-np.inf, np.inf], device='cuda')
+    
+    if pad_edge:
+        y_stars = torch.cat((torch.zeros((1, y_stars.shape[1]), device='cuda'),
+                               y_stars,
+                               torch.zeros((1, y_stars.shape[1]), device='cuda')), dim=0)
+        new_edges = torch.cat((torch.tensor([[-np.inf, new_edges[0,0]]], device='cuda'),
+                               new_edges,
+                               torch.tensor([[new_edges[-1,-1], np.inf]], device='cuda')), dim=0)
 
-    return y_stars, new_edges
+    else:
+        if inf_edge:
+            new_edges[[0, -1], [0, -1]] = torch.tensor([-np.inf, np.inf], device='cuda')
 
-def string_to_splits_np(series: pd.Series):
+    
+   
+    levels = pd.Index(series).dropna().drop_duplicates().sort_values()  #levels of time
+    return y_stars, new_edges, levels.get_indexer(series)
+
+def string_to_splits_np(series: pd.Series, pad_edge=False, inf_edge = False):
     '''
     Format should be list of  number_number
     '''
@@ -95,10 +107,19 @@ def string_to_splits_np(series: pd.Series):
     new_edges = new_edges[mask]
 
     y_stars = y_stars/y_stars.sum(axis=1, keepdims=True)
-    new_edges[[0, -1], [0, -1]] = np.array([-np.inf, np.inf])
+    if pad_edge:
+        new_edges = np.insert(new_edges, [0, len(new_edges)],
+                              [[-np.inf, edges[0,0]], [edges[-1,-1], np.inf]], axis=0)
+        y_stars = np.insert(y_stars, [0, len(y_stars)], [[0],[0]], axis=0)
 
-    return y_stars, new_edges
+    else:
+        if inf_edge:
+            new_edges[[0, -1], [0, -1]] = np.array([-np.inf, np.inf])
 
-def str_to_ord_levels(time: pd.Series):
+    levels = pd.Index(series).dropna().drop_duplicates().sort_values()  #levels of time 
+
+    return y_stars, new_edges, levels.get_indexer(series)
+
+def str_to_ord_levels(time: pd.Series, pad_edge=False):
     levels = pd.Index(time).dropna().drop_duplicates().sort_values()  #levels of time
     return levels.get_indexer(time)
