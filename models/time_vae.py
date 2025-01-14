@@ -17,16 +17,12 @@ class Time_Vae_ord(VanillaVAE):
                  y_stars: torch.Tensor,
                  edges: np.array,
                  *args,
-                 initial_time_weight = 0.01,
-                 final_time_weight = 0.5,
-                 n_epoch_ramp = 10,
+                 time_weight = 0.2,
                  **kwargs) -> None:
                 
                 super().__init__(*args, **kwargs)
                 
-                self.initial_time_weight = initial_time_weight
-                self.final_time_weight = final_time_weight
-                self.n_epoch_ramp = n_epoch_ramp
+                self.time_weight = time_weight
                 self.y_stars = y_stars
                 self.edges = edges
                 self.time_regressor = RegressorLinear(self.latent_dim)
@@ -44,9 +40,7 @@ class Time_Vae_ord(VanillaVAE):
         
         ord_loss = self.ord_loss(pred_time, time)
 
-        time_weight = self.get_time_weight(self.current_epoch)
-
-        loss = recons_loss + self.kl_weight * kld_loss + ord_loss*time_weight
+        loss = recons_loss + self.kl_weight * kld_loss + ord_loss*self.time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'ord_loss':ord_loss} 
     
