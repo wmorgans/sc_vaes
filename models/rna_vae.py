@@ -16,12 +16,14 @@ class VanillaVAE(BaseVAE):
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: nn.Sequential | None = None,
                  decoder: nn.Sequential | None = None,
+                 recon_weight = 1,
                  kl_weight = 0.05) -> None:
         super().__init__()
         self.save_hyperparameters()
 
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
+        self.recon_weight = recon_weight
 
         # Build Encoder
         if encoder is None:
@@ -100,12 +102,13 @@ class VanillaVAE(BaseVAE):
         log_var = args[3]
 
         kld_weight = self.kl_weight # Account for the minibatch samples from the dataset
+        recon_weight = self.recon_weight
         recons_loss =F.mse_loss(recons, input)
 
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
         kld_loss = kld_loss/mu.numel()
 
-        loss = recons_loss + kld_weight * kld_loss
+        loss = recon_weight*recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
 
     def sample(self,
@@ -165,6 +168,7 @@ class Gen_rna_vae_nb(VanillaVAE):
                  hidden_dims: List | None = [512, 256, 128, 64, 32],
                  encoder: Any | None = None,
                  decoder: Any | None = None,
+                 recon_weight = 1,
                  kl_weight = 0.05,
                  epsilon = 1e-8,
                  disp_range = (-10, 10),
@@ -183,7 +187,7 @@ class Gen_rna_vae_nb(VanillaVAE):
             hidden_dims.reverse()
 
         super().__init__(in_channels, latent_dim, hidden_dims=hidden_dims,
-                         encoder=encoder, decoder=decoder, kl_weight=kl_weight)
+                         encoder=encoder, decoder=decoder, kl_weight=kl_weight, recon_weight=recon_weight)
             
         self.log_dispersion = nn.Parameter(torch.rand(in_channels))
         self.epsilon = epsilon
@@ -243,12 +247,13 @@ class Gen_rna_vae_nb(VanillaVAE):
         scaled_pred_mean = args[3]
 
         kld_weight =  self.kl_weight
+        recon_weight = self.recon_weight
         recons_loss = self.get_nb_loss(input, scaled_pred_mean)
 
         kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp())
         kld_loss = kld_loss/mu.numel()
 
-        loss = recons_loss + kld_weight * kld_loss
+        loss = recon_weight * recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
 
     def training_step(self, batch, batch_idx):
