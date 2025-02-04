@@ -18,17 +18,29 @@ class Time_Vae_ord(VanillaVAE):
                  edges: np.array,
                  *args,
                  time_weight = 0.2,
+                 time_loss_ramp = False,
+                 initial_time_weight = 0.01,
+                 final_time_weight = 0.5,
+                 n_epoch_ramp = 10,
+                 time_weight = 0.2,
                  **kwargs) -> None:
                 
                 super().__init__(*args, **kwargs)
-                
-                self.time_weight = time_weight
+
+                self.time_loss_ramp = time_loss_ramp
+                self.initial_time_weight = initial_time_weight
+                self.final_time_weight = final_time_weight
+                self.n_epoch_ramp = n_epoch_ramp
                 self.y_stars = y_stars
                 self.edges = edges
+                self.time_weight = time_weight
                 self.time_regressor = RegressorLinear(self.latent_dim)
 
     def get_time_weight(self, epoch):
-        return self.initial_time_weight - ((self.initial_time_weight - self.final_time_weight) * (epoch / self.n_epoch_ramp))
+        if self.time_loss_ramp:
+            return self.initial_time_weight + (self.final_time_weight - self.initial_time_weight) * np.min([(epoch / self.n_epoch_ramp),1])
+        else:
+            return self.time_weight
 
     def loss_function(self, recons, input, mu, log_var, pred_time, time, **kwargs) -> dict:
         recons_loss =F.mse_loss(recons, input)
@@ -40,7 +52,9 @@ class Time_Vae_ord(VanillaVAE):
         
         ord_loss = self.ord_loss(pred_time, time)
 
-        loss = recons_loss + self.kl_weight * kld_loss + ord_loss*self.time_weight
+        time_weight = self.get_time_weight(self.current_epoch)
+
+        loss = self.recon_weight * recons_loss + self.kl_weight * kld_loss + ord_loss*time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'ord_loss':ord_loss} 
     
@@ -108,15 +122,24 @@ class Time_Vae_ord(VanillaVAE):
 
 class Time_Vae_reg(Time_Vae_ord, VanillaVAE):
     def __init__(self,
-            *args,
-            time_weight = 0.2,
-            **kwargs) -> None:
+                 *args,
+                 time_loss_ramp = False,
+                 initial_time_weight = 0.01,
+                 final_time_weight = 0.5,
+                 n_epoch_ramp = 10,
+                 time_weight = 0.2,
+                 **kwargs) -> None:
         VanillaVAE.__init__(self, *args, **kwargs)
+        self.time_loss_ramp = time_loss_ramp
+        self.initial_time_weight = initial_time_weight
+        self.final_time_weight = final_time_weight
+        self.n_epoch_ramp = n_epoch_ramp
         self.time_weight = time_weight
         self.time_regressor = RegressorLinear(self.latent_dim)
     
     def loss_function(self, recons, input, mu, log_var, pred_time, time, **kwargs) -> dict:
         kld_weight =  self.kl_weight
+        time_weight = self.get_time_weight(self.current_epoch)
         recons_loss = F.mse_loss(input, recons)
 
         kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp())
@@ -124,7 +147,7 @@ class Time_Vae_reg(Time_Vae_ord, VanillaVAE):
 
         reg_loss = F.mse_loss(pred_time, time)
 
-        loss = recons_loss + kld_weight * kld_loss + reg_loss*self.time_weight
+        loss = self.recon_weight * recons_loss + kld_weight * kld_loss + reg_loss*time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'reg_loss':reg_loss} 
 
@@ -160,7 +183,10 @@ class Time_Vae_ord_nb(Gen_rna_vae_nb):
         return [self.decode(z, batch), input, mu, log_var, pred_time]
      
     def loss_function(self, scaled_pred_mean, input, mu, log_var, pred_time, time, **kwargs) -> dict:
+        time_weight = self.time_weight
         kld_weight =  self.kl_weight
+        recon_weight = self.recon_weight
+
         recons_loss = self.get_nb_loss(input, scaled_pred_mean)
 
         kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp())
@@ -168,7 +194,7 @@ class Time_Vae_ord_nb(Gen_rna_vae_nb):
 
         ord_loss = self.ord_loss(pred_time, time)
 
-        loss = recons_loss + kld_weight * kld_loss + ord_loss*self.time_weight
+        loss = recon_weight * recons_loss + kld_weight * kld_loss + ord_loss*time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'ord_loss':ord_loss}
         
@@ -245,7 +271,7 @@ class Time_Vae_reg_nb(Time_Vae_ord_nb, Gen_rna_vae_nb):
 
         reg_loss = F.mse_loss(pred_time, time)
         
-        loss = recons_loss + self.kl_weight * kld_loss + reg_loss*self.time_weight
+        loss = self.recon_weight*recons_loss + self.kl_weight * kld_loss + reg_loss*self.time_weight
         return {'loss': loss, 'Reconstruction_Loss':recons_loss,
                 'KLD':kld_loss, 'reg_loss':reg_loss} 
             
