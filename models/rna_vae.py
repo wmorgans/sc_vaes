@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from ..types import *
 from ..utils import FC_block
 
-EPS = 1e-8
+EPS = 1e-10
 
 class VanillaVAE(BaseVAE):
 
@@ -17,13 +17,15 @@ class VanillaVAE(BaseVAE):
                  encoder: nn.Sequential | None = None,
                  decoder: nn.Sequential | None = None,
                  recon_weight = 1,
-                 kl_weight = 0.05) -> None:
+                 kl_weight = 0.2,
+                 learning_rate = 0.001) -> None:
         super().__init__()
         self.save_hyperparameters()
 
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
         self.recon_weight = recon_weight
+        self.learning_rate = learning_rate
 
         # Build Encoder
         if encoder is None:
@@ -78,8 +80,9 @@ class VanillaVAE(BaseVAE):
         :return: (Tensor) [B x D]
         """
         std = torch.exp(0.5 * logvar)
+        std = torch.clamp(std, min=1e-8, max=1e8)
         eps = torch.randn_like(std)
-        return eps * std + mu
+        return (eps * std) + mu
 
     def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
         mu, log_var = self.encode(input)
@@ -105,11 +108,12 @@ class VanillaVAE(BaseVAE):
         recon_weight = self.recon_weight
         recons_loss =F.mse_loss(recons, input)
 
+        # kl loss batch mean -> per element to fit with MSE (and later time regression)
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-        kld_loss = kld_loss/mu.numel()
+        kld_loss = kld_loss/mu.shape[1]
 
         loss = recon_weight*recons_loss + kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
+        return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
 
     def sample(self,
                num_samples:int,
@@ -141,7 +145,7 @@ class VanillaVAE(BaseVAE):
     def training_step(self, batch, batch_idx):
         x  =  batch[0]
         losses = self.loss_function(*self.forward(x))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict(losses, on_step=False, on_epoch=True)
         return losses['loss']
     
     def test_step(self, batch, batch_idx):
@@ -154,12 +158,14 @@ class VanillaVAE(BaseVAE):
         # this is the validation loop
         x = batch[0]
         losses = self.loss_function(*self.forward(x))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict(losses, on_step=False, on_epoch=True)
         val_loss = losses['loss']
-        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        val_unweighted = losses['Reconstruction_Loss'] + losses['recons_loss']
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True)
+        self.log("val_unweighted", val_unweighted, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=0.001)
+        return optim.Adam(self.parameters(), lr=self.learning_rate)
     
 class Gen_rna_vae_nb(VanillaVAE):
     def __init__(self,
@@ -169,7 +175,7 @@ class Gen_rna_vae_nb(VanillaVAE):
                  encoder: Any | None = None,
                  decoder: Any | None = None,
                  recon_weight = 1,
-                 kl_weight = 0.05,
+                 kl_weight = 0.2,
                  epsilon = 1e-8,
                  disp_range = (-10, 10),
                  **kwargs) -> None:
@@ -187,7 +193,8 @@ class Gen_rna_vae_nb(VanillaVAE):
             hidden_dims.reverse()
 
         super().__init__(in_channels, latent_dim, hidden_dims=hidden_dims,
-                         encoder=encoder, decoder=decoder, kl_weight=kl_weight, recon_weight=recon_weight)
+                         encoder=encoder, decoder=decoder, kl_weight=kl_weight,
+                         recon_weight=recon_weight, **kwargs)
             
         self.log_dispersion = nn.Parameter(torch.rand(in_channels))
         self.epsilon = epsilon
@@ -221,13 +228,14 @@ class Gen_rna_vae_nb(VanillaVAE):
         :return: (Tensor) [B x F]
         """
         input = torch.cat((z, batch), 1)
-        pred_mean = self.decoder(input)
-        return pred_mean
+        pred_proportions = self.decoder(input)
+        return pred_proportions
     
     def forward(self, input: Tensor, batch, **kwargs) -> List[Tensor]:
         mu, log_var = self.encode(input, batch)
         z = self.reparameterize(mu, log_var)
-        pred_mean = self.decode(z, batch)  #mean gamma (scVI px_scale)
+        pred_proportions = self.decode(z, batch)  #mean gamma (scVI px_scale)
+        pred_mean = pred_proportions * input.sum(axis=1).unsqueeze(1) #multiply by read depth
                                                                         
         return  [input, mu, log_var, pred_mean]
 
@@ -250,8 +258,9 @@ class Gen_rna_vae_nb(VanillaVAE):
         recon_weight = self.recon_weight
         recons_loss = self.get_nb_loss(input, scaled_pred_mean)
 
-        kld_loss = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp())
-        kld_loss = kld_loss/mu.numel()
+        # kl loss batch mean -> per element to fit with MSE (and later time regression)
+        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+        kld_loss = kld_loss/mu.shape[1]
 
         loss = recon_weight * recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':kld_loss}
@@ -261,7 +270,7 @@ class Gen_rna_vae_nb(VanillaVAE):
         batch_id = batch[1]['batch']
 
         losses = self.loss_function(*self.forward(x, batch_id))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict(losses, on_step=False, on_epoch=True)
         return losses['loss']
     
     def test_step(self, batch, batch_idx):
@@ -277,9 +286,11 @@ class Gen_rna_vae_nb(VanillaVAE):
         batch_id = batch[1]['batch']
 
         losses = self.loss_function(*self.forward(x, batch_id))
-        self.log_dict(losses, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict(losses, on_step=False, on_epoch=True)
         val_loss = losses['loss']
-        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True)
+        val_unweighted = losses['Reconstruction_Loss'] + losses['recons_loss']
+        self.log("val_unweighted", val_unweighted, on_step=False, on_epoch=True)
     
     
     def get_nb_loss(self, x, mean_poiss):
@@ -311,7 +322,7 @@ class Gen_rna_vae_zinb(Gen_rna_vae_nb):
                  encoder: Any | None = None,
                  decoder: Any | None = None,
                  dropout_nn: Any | None = None,
-                 kl_weight = 0.00025,
+                 kl_weight = 0.2,
                  **kwargs) -> None:
         
         # Build dropout
@@ -346,8 +357,10 @@ class Gen_rna_vae_zinb(Gen_rna_vae_nb):
         kld_weight =  self.kl_weight
         recons_loss = self.get_zinb_loss(input, mean_poisson, p_drop_out, self.dispersion)
 
+        # kl loss batch mean -> per element to fit with MSE (and later time regression)
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
+        kld_loss = kld_loss/mu.shape[1]
+        
         loss = recons_loss + kld_weight * kld_loss
         return {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
     
